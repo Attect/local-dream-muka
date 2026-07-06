@@ -246,6 +246,15 @@ void decode_image(const std::vector<uint8_t> &image_binary,
     // throw std::runtime_error("Failed to decode image: " + error_msg);
   }
 
+  // Exact-size upload (the common case for img2img/ultrafix where the client
+  // already sized the image): skip the resize/crop round trip entirely.
+  if (width == output_width && height == output_height) {
+    output_pixels.assign(decoded_data,
+                         decoded_data + (size_t)3 * width * height);
+    stbi_image_free(decoded_data);
+    return;
+  }
+
   // Determine the scale and crop dimensions to maintain aspect ratio
   float scale = std::max(static_cast<float>(output_width) / width,
                          static_cast<float>(output_height) / height);

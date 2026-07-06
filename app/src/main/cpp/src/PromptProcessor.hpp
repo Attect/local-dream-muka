@@ -10,19 +10,31 @@
 #include <string>
 #include <vector>
 
+#include "Logger.hpp"
 #include "SafeTensorReader.hpp"
 
 struct PromptToken {
   std::string text;
   float weight;
   bool is_embedding;
-  std::vector<float> embedding_data;
+  std::vector<float> embedding_data;    // 768-dim (SD1.5 / SDXL encoder 1)
+  std::vector<float> embedding_data_2;  // 1280-dim (SDXL encoder 2)
+  // Byte offset of this token's text in the original prompt. Lets callers map
+  // a token-count limit back to a character position (e.g. greying overflow).
+  size_t source_start = 0;
+  // Original-prompt byte offset of each byte of `text` (size == text.size()).
+  // `text` is the cleaned form (whitespace collapsed, escapes resolved), so a
+  // sub-word offset into it must be translated through this map to address the
+  // matching character in the user's untouched prompt.
+  std::vector<size_t> char_src;
 };
 
 class PromptProcessor {
  private:
-  std::map<std::string, std::vector<float>> embeddings_;
+  std::map<std::string, std::vector<float>> embeddings_;    // last-dim 768
+  std::map<std::string, std::vector<float>> embeddings_2_;  // last-dim 1280
   std::string embeddings_dir_;
+  bool sdxl_mode_ = false;
 
   static std::string toLowerCase(const std::string &str) {
     std::string result = str;
@@ -43,8 +55,11 @@ class PromptProcessor {
     float weight;
     std::vector<TokenNode> children;
     bool is_group;
+    size_t source_start;  // byte offset of text in the original prompt
+    std::vector<size_t>
+        char_src;  // per-byte original offsets (see PromptToken)
 
-    TokenNode() : weight(1.0f), is_group(false) {}
+    TokenNode() : weight(1.0f), is_group(false), source_start(0) {}
   };
 
   TokenNode parsePromptTree(const std::string &prompt) {
@@ -55,10 +70,51 @@ class PromptProcessor {
     node_stack.push(&root);
 
     std::string current_text;
+    // current_src[k] is the original-prompt byte offset of current_text[k], so
+    // the cleaned text stays mappable back to the user's untouched prompt.
+    std::vector<size_t> current_src;
     size_t i = 0;
+
+    auto is_ws = [](char ch) {
+      return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+    };
+
+    // Emit a leaf node for current_text[b, e), carrying the matching slice of
+    // current_src. Callers pass the trimmed bounds so the node's text and its
+    // source map stay aligned.
+    auto emit_text = [&](size_t b, size_t e, float weight) {
+      while (b < e && is_ws(current_text[b])) b++;
+      while (e > b && is_ws(current_text[e - 1])) e--;
+      if (b >= e) return;
+      TokenNode text_node;
+      text_node.text = current_text.substr(b, e - b);
+      text_node.weight = weight;
+      text_node.is_group = false;
+      text_node.source_start = current_src[b];
+      text_node.char_src.assign(current_src.begin() + b,
+                                current_src.begin() + e);
+      node_stack.top()->children.push_back(text_node);
+    };
+
+    auto flush_text = [&](float weight) {
+      if (!current_text.empty()) emit_text(0, current_text.size(), weight);
+      current_text.clear();
+      current_src.clear();
+    };
 
     while (i < prompt.length()) {
       char c = prompt[i];
+
+      if (c == '\\' && i + 1 < prompt.length()) {
+        char next = prompt[i + 1];
+        if (next == '(' || next == ')' || next == '[' || next == ']' ||
+            next == '\\' || next == ',' || next == ':') {
+          current_text += next;
+          current_src.push_back(i);  // map the escaped char to the backslash
+          i += 2;
+          continue;
+        }
+      }
 
       if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
         if (!current_text.empty() && i + 1 < prompt.length()) {
@@ -66,6 +122,7 @@ class PromptProcessor {
           if (next != '(' && next != ')' && next != '[' && next != ']' &&
               next != ',' && next != ' ' && next != '\t') {
             current_text += ' ';
+            current_src.push_back(i);
           }
         }
         i++;
@@ -73,16 +130,7 @@ class PromptProcessor {
       }
 
       if (c == '(') {
-        if (!current_text.empty()) {
-          TokenNode text_node;
-          text_node.text = trim(current_text);
-          text_node.weight = 1.0f;
-          text_node.is_group = false;
-          if (!text_node.text.empty()) {
-            node_stack.top()->children.push_back(text_node);
-          }
-          current_text.clear();
-        }
+        flush_text(1.0f);
 
         TokenNode *parent = node_stack.top();
         parent->children.push_back(TokenNode());
@@ -100,33 +148,21 @@ class PromptProcessor {
           if (colon_pos != std::string::npos && node_stack.size() > 1 &&
               node_stack.top()->is_group) {
             std::string weight_str = trim(current_text.substr(colon_pos + 1));
-            std::string text_part = trim(current_text.substr(0, colon_pos));
 
             try {
               float weight = std::stof(weight_str);
-              TokenNode text_node;
-              text_node.text = text_part;
-              text_node.weight = weight;
-              text_node.is_group = false;
-              if (!text_node.text.empty()) {
-                node_stack.top()->children.push_back(text_node);
-              }
+              emit_text(0, colon_pos, weight);
               has_weight = true;
+              current_text.clear();
+              current_src.clear();
             } catch (...) {
               // failed to parse weight
             }
           }
 
           if (!has_weight) {
-            TokenNode text_node;
-            text_node.text = trim(current_text);
-            text_node.weight = 1.0f;
-            text_node.is_group = false;
-            if (!text_node.text.empty()) {
-              node_stack.top()->children.push_back(text_node);
-            }
+            flush_text(1.0f);
           }
-          current_text.clear();
         }
 
         if (node_stack.size() > 1) {
@@ -135,16 +171,7 @@ class PromptProcessor {
         i++;
 
       } else if (c == '[') {
-        if (!current_text.empty()) {
-          TokenNode text_node;
-          text_node.text = trim(current_text);
-          text_node.weight = 1.0f;
-          text_node.is_group = false;
-          if (!text_node.text.empty()) {
-            node_stack.top()->children.push_back(text_node);
-          }
-          current_text.clear();
-        }
+        flush_text(1.0f);
 
         TokenNode *parent = node_stack.top();
         parent->children.push_back(TokenNode());
@@ -155,16 +182,7 @@ class PromptProcessor {
         i++;
 
       } else if (c == ']') {
-        if (!current_text.empty()) {
-          TokenNode text_node;
-          text_node.text = trim(current_text);
-          text_node.weight = 1.0f;
-          text_node.is_group = false;
-          if (!text_node.text.empty()) {
-            node_stack.top()->children.push_back(text_node);
-          }
-          current_text.clear();
-        }
+        flush_text(1.0f);
 
         if (node_stack.size() > 1) {
           node_stack.pop();
@@ -172,38 +190,24 @@ class PromptProcessor {
         i++;
 
       } else if (c == ',') {
-        if (!current_text.empty()) {
-          TokenNode text_node;
-          text_node.text = trim(current_text);
-          text_node.weight = 1.0f;
-          text_node.is_group = false;
-          if (!text_node.text.empty()) {
-            node_stack.top()->children.push_back(text_node);
-          }
-          current_text.clear();
-        }
+        flush_text(1.0f);
         TokenNode comma_node;
         comma_node.text = ",";
         comma_node.weight = 1.0f;
         comma_node.is_group = false;
+        comma_node.source_start = i;
+        comma_node.char_src.push_back(i);
         node_stack.top()->children.push_back(comma_node);
         i++;
 
       } else {
         current_text += c;
+        current_src.push_back(i);
         i++;
       }
     }
 
-    if (!current_text.empty()) {
-      TokenNode text_node;
-      text_node.text = trim(current_text);
-      text_node.weight = 1.0f;
-      text_node.is_group = false;
-      if (!text_node.text.empty()) {
-        node_stack.top()->children.push_back(text_node);
-      }
-    }
+    flush_text(1.0f);
 
     return root;
   }
@@ -220,11 +224,33 @@ class PromptProcessor {
       if (!node.text.empty()) {
         std::string text_lower = toLowerCase(node.text);
 
-        if (embeddings_.find(text_lower) != embeddings_.end()) {
-          tokens.push_back(
-              {node.text, current_weight, true, embeddings_[text_lower]});
+        auto it1 = embeddings_.find(text_lower);
+        auto it2 = embeddings_2_.find(text_lower);
+        bool found1 = it1 != embeddings_.end();
+        bool found2 = it2 != embeddings_2_.end();
+        // For SDXL the loader keeps both maps in sync; for SD1.5 only
+        // embeddings_ is populated. If a token only matches embeddings_2_
+        // the data isn't usable in the current mode, so fall through to
+        // text tokenization instead of silently dropping the word.
+        if (found1 || (sdxl_mode_ && found2)) {
+          PromptToken t;
+          t.text = node.text;
+          t.weight = current_weight;
+          t.is_embedding = true;
+          if (found1) t.embedding_data = it1->second;
+          if (found2) t.embedding_data_2 = it2->second;
+          // Embeddings are indivisible vector blocks, so only the start offset
+          // is needed (the whole word is flagged on overflow); char_src unused.
+          t.source_start = node.source_start;
+          tokens.push_back(std::move(t));
         } else {
-          tokens.push_back({node.text, current_weight, false, {}});
+          tokens.push_back({node.text,
+                            current_weight,
+                            false,
+                            {},
+                            {},
+                            node.source_start,
+                            node.char_src});
         }
       }
     }
@@ -233,9 +259,11 @@ class PromptProcessor {
  public:
   PromptProcessor() = default;
 
-  void loadEmbeddings(const std::string &embeddings_dir) {
+  void loadEmbeddings(const std::string &embeddings_dir, bool sdxl_mode) {
     embeddings_dir_ = embeddings_dir;
+    sdxl_mode_ = sdxl_mode;
     embeddings_.clear();
+    embeddings_2_.clear();
 
     if (!std::filesystem::exists(embeddings_dir)) {
       return;
@@ -243,20 +271,70 @@ class PromptProcessor {
 
     for (const auto &entry :
          std::filesystem::directory_iterator(embeddings_dir)) {
-      if (entry.path().extension() == ".safetensors") {
-        try {
-          SafeTensorReader reader(entry.path().string());
-          std::string name = entry.path().stem().string();
-          std::string name_lower = toLowerCase(name);
+      if (entry.path().extension() != ".safetensors") continue;
 
-          auto tensor_names = reader.get_tensor_names();
-          if (!tensor_names.empty()) {
-            reader.read(tensor_names[0], true);
-            embeddings_[name_lower] = reader.data;
+      try {
+        SafeTensorReader reader(entry.path().string());
+        std::string name = entry.path().stem().string();
+        std::string name_lower = toLowerCase(name);
+
+        auto tensor_names = reader.get_tensor_names();
+
+        // Prefer well-known SDXL TI key names (clip_l / clip_g) over blind
+        // dimension matching. Falls back to first matching shape if naming
+        // is non-standard.
+        std::string key_768, key_1280;
+        for (const auto &tn : tensor_names) {
+          std::string tn_lower = toLowerCase(tn);
+          auto shape = reader.get_tensor_shape(tn);
+          if (shape.empty()) continue;
+          int last_dim = shape.back();
+          if (last_dim == 768 && key_768.empty() &&
+              (tn_lower.find("clip_l") != std::string::npos ||
+               tn_lower.find("emb_params") != std::string::npos ||
+               tn_lower.find("string_to_param") != std::string::npos)) {
+            key_768 = tn;
           }
-        } catch (const std::exception &e) {
-          // could not load this embedding
+          if (last_dim == 1280 && key_1280.empty() &&
+              tn_lower.find("clip_g") != std::string::npos) {
+            key_1280 = tn;
+          }
         }
+        for (const auto &tn : tensor_names) {
+          auto shape = reader.get_tensor_shape(tn);
+          if (shape.empty()) continue;
+          int last_dim = shape.back();
+          if (last_dim == 768 && key_768.empty()) key_768 = tn;
+          if (last_dim == 1280 && key_1280.empty()) key_1280 = tn;
+        }
+
+        if (sdxl_mode) {
+          // SDXL TIs always carry both 768 (clip_l) and 1280 (clip_g).
+          // Files missing either side would pollute the corresponding
+          // encoder slot with a pad token, so skip them.
+          if (key_768.empty() || key_1280.empty()) {
+            QNN_WARN(
+                "Skip embedding '%s': SDXL requires both 768 and 1280 dim "
+                "tensors",
+                name.c_str());
+            continue;
+          }
+          reader.read(key_1280, true);
+          embeddings_2_[name_lower] = reader.data;
+          reader.read(key_768, true);
+          embeddings_[name_lower] = reader.data;
+        } else {
+          if (key_768.empty()) {
+            QNN_WARN("Skip embedding '%s': SD1.5 requires a 768-dim tensor",
+                     name.c_str());
+            continue;
+          }
+          reader.read(key_768, true);
+          embeddings_[name_lower] = reader.data;
+        }
+      } catch (const std::exception &e) {
+        QNN_WARN("Failed to load embedding %s: %s",
+                 entry.path().string().c_str(), e.what());
       }
     }
   }
@@ -272,8 +350,12 @@ class PromptProcessor {
   }
 
   size_t getEmbeddingCount() const { return embeddings_.size(); }
+  size_t getEmbedding2Count() const { return embeddings_2_.size(); }
 
   bool hasEmbedding(const std::string &name) const {
     return embeddings_.find(toLowerCase(name)) != embeddings_.end();
+  }
+  bool hasEmbedding2(const std::string &name) const {
+    return embeddings_2_.find(toLowerCase(name)) != embeddings_2_.end();
   }
 };

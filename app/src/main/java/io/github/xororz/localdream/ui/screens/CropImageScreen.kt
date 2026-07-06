@@ -14,8 +14,9 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ContainedLoadingIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -48,18 +49,21 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun CropImageScreen(
     imageUri: Uri,
     width: Int,
     height: Int,
     onCropComplete: (String, Bitmap, AndroidRect) -> Unit,
-    onCancel: () -> Unit
+    onCancel: () -> Unit,
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val cropifyState = rememberCropifyState()
+
+    val msgErrorWithDetail = stringResource(R.string.error_with_detail)
+    val msgUnknownError = stringResource(R.string.unknown_error)
 
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
@@ -76,19 +80,20 @@ fun CropImageScreen(
             try {
                 val androidBitmap = bitmap.asAndroidBitmap()
 
-                // Reflection to get frameRect and imageRect
-                val frameRectField =
-                    cropifyState::class.java.getDeclaredField("frameRect\$delegate")
-                frameRectField.isAccessible = true
-                val frameRectState =
-                    frameRectField.get(cropifyState) as State<androidx.compose.ui.geometry.Rect>
+                // Reflection to get frameRect and imageRect from Cropify internals.
+                // Generic type is erased through Field.get(); suppression is intentional.
+                @Suppress("UNCHECKED_CAST")
+                val frameRectState = cropifyState::class.java
+                    .getDeclaredField("frameRect\$delegate")
+                    .apply { isAccessible = true }
+                    .get(cropifyState) as State<androidx.compose.ui.geometry.Rect>
                 val frameRect = frameRectState.value
 
-                val imageRectField =
-                    cropifyState::class.java.getDeclaredField("imageRect\$delegate")
-                imageRectField.isAccessible = true
-                val imageRectState =
-                    imageRectField.get(cropifyState) as State<androidx.compose.ui.geometry.Rect>
+                @Suppress("UNCHECKED_CAST")
+                val imageRectState = cropifyState::class.java
+                    .getDeclaredField("imageRect\$delegate")
+                    .apply { isAccessible = true }
+                    .get(cropifyState) as State<androidx.compose.ui.geometry.Rect>
                 val imageRect = imageRectState.value
 
                 // Get original image dimensions
@@ -115,7 +120,7 @@ fun CropImageScreen(
                 }
                 onCropComplete(base64String, androidBitmap, cropRect)
             } catch (e: Exception) {
-                errorMessage = "Error: ${e.message}"
+                errorMessage = msgErrorWithDetail.format(e.message ?: msgUnknownError)
             } finally {
                 isLoading = false
             }
@@ -135,7 +140,7 @@ fun CropImageScreen(
                     IconButton(onClick = onCancel) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back"
+                            contentDescription = "Back",
                         )
                     }
                 },
@@ -143,46 +148,46 @@ fun CropImageScreen(
                     IconButton(onClick = { cropifyState.crop() }) {
                         Icon(
                             imageVector = Icons.Default.Check,
-                            contentDescription = "Crop"
+                            contentDescription = "Crop",
                         )
                     }
-                }
+                },
             )
-        }
+        },
     ) { paddingValues ->
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(paddingValues)
+                .padding(paddingValues),
         ) {
             Cropify(
                 uri = imageUri,
                 state = cropifyState,
                 onImageCropped = handleCroppedImage,
                 onFailedToLoadImage = { error ->
-                    errorMessage = "Error: ${error.message}"
+                    errorMessage = msgErrorWithDetail.format(error.message ?: msgUnknownError)
                 },
                 option = CropifyOption(
                     frameSize = CropifySize.FixedAspectRatio(aspectRatio),
                     frameColor = MaterialTheme.colorScheme.primary,
-                    gridColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
+                    gridColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f),
                 ),
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 16.dp)
+                    .padding(horizontal = 16.dp),
             )
 
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(16.dp)
-                    .align(Alignment.BottomCenter)
+                    .align(Alignment.BottomCenter),
             ) {
                 Text(
                     text = stringResource(R.string.crop_hint),
                     style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
-                    modifier = Modifier.align(Alignment.Center)
+                    color = Color.White.copy(alpha = 0.7f),
+                    modifier = Modifier.align(Alignment.Center),
                 )
             }
 
@@ -191,9 +196,9 @@ fun CropImageScreen(
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(16.dp),
-                    contentAlignment = Alignment.Center
+                    contentAlignment = Alignment.Center,
                 ) {
-                    CircularProgressIndicator()
+                    ContainedLoadingIndicator()
                 }
             }
 
@@ -202,18 +207,18 @@ fun CropImageScreen(
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(16.dp),
-                    contentAlignment = Alignment.Center
+                    contentAlignment = Alignment.Center,
                 ) {
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.errorContainer
-                        )
+                            containerColor = MaterialTheme.colorScheme.errorContainer,
+                        ),
                     ) {
                         Text(
                             text = error,
                             modifier = Modifier.padding(16.dp),
-                            color = MaterialTheme.colorScheme.onErrorContainer
+                            color = MaterialTheme.colorScheme.onErrorContainer,
                         )
                     }
                 }

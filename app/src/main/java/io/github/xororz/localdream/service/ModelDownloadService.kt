@@ -9,6 +9,13 @@ import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import io.github.xororz.localdream.R
+import io.github.xororz.localdream.data.Model
+import io.github.xororz.localdream.utils.Http
+import java.io.File
+import java.io.FileOutputStream
+import java.util.concurrent.TimeUnit
+import java.util.zip.ZipInputStream
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -17,12 +24,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
 import okhttp3.Request
-import java.io.File
-import java.io.FileOutputStream
-import java.util.concurrent.TimeUnit
-import java.util.zip.ZipInputStream
 
 class ModelDownloadService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
@@ -32,7 +34,7 @@ class ModelDownloadService : Service() {
         getSystemService(NOTIFICATION_SERVICE) as NotificationManager
     }
 
-    private val client = OkHttpClient.Builder()
+    private val client = Http.client.newBuilder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
@@ -62,7 +64,7 @@ class ModelDownloadService : Service() {
             val modelId: String,
             val progress: Float,
             val downloadedBytes: Long,
-            val totalBytes: Long
+            val totalBytes: Long,
         ) : DownloadState()
 
         data class Extracting(val modelId: String) : DownloadState()
@@ -102,7 +104,7 @@ class ModelDownloadService : Service() {
         fileUrl: String,
         isZip: Boolean,
         isNpu: Boolean,
-        modelType: String
+        modelType: String,
     ) {
         downloadJob?.cancel()
         downloadJob = serviceScope.launch {
@@ -156,13 +158,17 @@ class ModelDownloadService : Service() {
                         val upscalerDir = File(getModelsDir(), modelId).apply {
                             if (!exists()) mkdirs()
                         }
-                        val targetFile = File(upscalerDir, "upscaler.bin")
+                        val targetFile = File(upscalerDir, Model.UPSCALER_FILE_NAME)
 
                         if (targetFile.exists()) {
                             targetFile.delete()
                         }
 
-                        tempFile.renameTo(targetFile)
+                        // Don't report success on a failed move: it would leave
+                        // an empty model dir that the UI/loader can't use.
+                        if (!tempFile.renameTo(targetFile)) {
+                            tempFile.copyTo(targetFile, overwrite = true)
+                        }
                     }
                 }
 
@@ -178,14 +184,21 @@ class ModelDownloadService : Service() {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
-
+            } catch (e: CancellationException) {
+                // Cancellation (service reclaimed, a new download started, or
+                // explicit cancel) is not a download failure: re-throw so it is
+                // not surfaced as an "Error" state. Emitting Error here is what
+                // produced the spurious "Job was cancelled" snackbar that could
+                // appear right after a successful download finished.
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Download failed", e)
 
                 tempFile?.delete()
                 extractTempDir?.deleteRecursively()
 
-                _downloadState.value = DownloadState.Error(modelId, e.message ?: "Unknown error")
+                _downloadState.value =
+                    DownloadState.Error(modelId, e.message ?: getString(R.string.unknown_error))
                 updateNotification(modelName, 0f, false, e.message)
 
                 withContext(Dispatchers.Main) {
@@ -198,19 +211,14 @@ class ModelDownloadService : Service() {
         }
     }
 
-    private suspend fun downloadFile(
-        url: String,
-        destFile: File,
-        modelId: String,
-        modelName: String
-    ) = withContext(Dispatchers.IO) {
+    private suspend fun downloadFile(url: String, destFile: File, modelId: String, modelName: String) = withContext(Dispatchers.IO) {
         val request = Request.Builder()
             .url(url)
             .build()
 
         client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
-                throw Exception("Download failed with code: ${response.code}")
+                throw Exception(getString(R.string.error_download_failed, response.code.toString()))
             }
 
             val body = response.body ?: throw Exception("Response body is null")
@@ -232,13 +240,15 @@ class ModelDownloadService : Service() {
                             lastUpdateTime = currentTime
                             val progress = if (totalBytes > 0) {
                                 downloadedBytes.toFloat() / totalBytes
-                            } else 0f
+                            } else {
+                                0f
+                            }
 
                             _downloadState.value = DownloadState.Downloading(
                                 modelId,
                                 progress,
                                 downloadedBytes,
-                                totalBytes
+                                totalBytes,
                             )
 
                             updateNotification(modelName, progress)
@@ -246,13 +256,18 @@ class ModelDownloadService : Service() {
                     }
                 }
             }
+
+            // Guard against silently truncated downloads: a dropped connection
+            // ends the read loop without throwing, leaving a partial file.
+            if (totalBytes > 0 && downloadedBytes != totalBytes) {
+                throw Exception(
+                    getString(R.string.error_download_failed, "$downloadedBytes/$totalBytes"),
+                )
+            }
         }
     }
 
-    private suspend fun unzipFile(
-        zipFile: File,
-        destDir: File,
-    ) = withContext(Dispatchers.IO) {
+    private suspend fun unzipFile(zipFile: File, destDir: File) = withContext(Dispatchers.IO) {
         ZipInputStream(zipFile.inputStream().buffered()).use { zis ->
             var entry = zis.nextEntry
 
@@ -280,17 +295,15 @@ class ModelDownloadService : Service() {
         stopSelf()
     }
 
-    private fun getModelsDir(): File {
-        return File(filesDir, "models").apply {
-            if (!exists()) mkdirs()
-        }
+    private fun getModelsDir(): File = File(filesDir, "models").apply {
+        if (!exists()) mkdirs()
     }
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
             NOTIFICATION_CHANNEL_ID,
             getString(R.string.model_download_channel),
-            NotificationManager.IMPORTANCE_LOW
+            NotificationManager.IMPORTANCE_LOW,
         ).apply {
             description = getString(R.string.model_download_channel_desc)
         }
@@ -300,7 +313,7 @@ class ModelDownloadService : Service() {
     private fun createNotification(
         modelName: String,
         progress: Float,
-        isExtracting: Boolean = false
+        isExtracting: Boolean = false,
     ): android.app.Notification {
         val title = if (isExtracting) {
             getString(R.string.extracting)
@@ -315,7 +328,7 @@ class ModelDownloadService : Service() {
             this,
             0,
             openAppIntent,
-            PendingIntent.FLAG_IMMUTABLE
+            PendingIntent.FLAG_IMMUTABLE,
         )
 
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
@@ -332,7 +345,7 @@ class ModelDownloadService : Service() {
         progress: Float,
         success: Boolean = false,
         error: String? = null,
-        isExtracting: Boolean = false
+        isExtracting: Boolean = false,
     ) {
         val notification = when {
             success -> {
@@ -365,9 +378,19 @@ class ModelDownloadService : Service() {
 
     override fun onTimeout(startId: Int) {
         super.onTimeout(startId)
-        Log.e(TAG, "Foreground service timeout")
+        handleTimeout(0)
+    }
+
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        super.onTimeout(startId, fgsType)
+        handleTimeout(fgsType)
+    }
+
+    private fun handleTimeout(fgsType: Int) {
+        Log.e(TAG, "Foreground service timeout (fgsType=$fgsType)")
+        downloadJob?.cancel()
         _downloadState.value = DownloadState.Error("timeout", "Foreground service timeout")
-        updateNotification("Timeout", 0f, false, "Service timeout")
+        stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 

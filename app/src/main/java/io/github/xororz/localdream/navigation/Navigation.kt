@@ -7,4 +7,6 @@ sealed class Screen(val route: String) {
     }
 
     object Upscale : Screen("upscale")
+
+    object History : Screen("history")
 }

@@ -19,7 +19,9 @@ class DPMSolverMultistepScheduler : public Scheduler {
                               float beta_end, const std::string &beta_schedule,
                               int solver_order,
                               const std::string &prediction_type,
-                              const std::string &timestep_spacing)
+                              const std::string &timestep_spacing,
+                              bool use_karras_sigmas = false,
+                              const std::string &algorithm_type = "dpmsolver++")
       : num_train_timesteps_(num_train_timesteps),
         beta_start_(beta_start),
         beta_end_(beta_end),
@@ -27,7 +29,14 @@ class DPMSolverMultistepScheduler : public Scheduler {
         solver_order_(solver_order),
         prediction_type_(prediction_type),
         timestep_spacing_(timestep_spacing),
+        use_karras_sigmas_(use_karras_sigmas),
+        algorithm_type_(algorithm_type),
         lower_order_final_(true) {
+    if (algorithm_type_ != "dpmsolver++" &&
+        algorithm_type_ != "sde-dpmsolver++") {
+      throw std::runtime_error("Unsupported algorithm_type: " +
+                               algorithm_type_);
+    }
     if (beta_schedule == "scaled_linear") {
       float beta_start_sqrt = std::sqrt(beta_start_);
       float beta_end_sqrt = std::sqrt(beta_end_);
@@ -58,22 +67,88 @@ class DPMSolverMultistepScheduler : public Scheduler {
   void set_timesteps(int num_inference_steps) override {
     num_inference_steps_ = num_inference_steps;
 
-    if (timestep_spacing_ == "leading") {
-      int step_ratio = num_train_timesteps_ / (num_inference_steps + 1);
-      xt::xarray<int> steps = xt::cast<int>(xt::round(
-          xt::arange<float>(0, num_inference_steps + 1) * float(step_ratio)));
-      timesteps_ = xt::view(xt::flip(steps, 0), xt::range(0, steps.size() - 1));
-    } else {
-      throw std::runtime_error(timestep_spacing_ + " is not supported");
+    // Base sigmas from alphas_cumprod (ascending order)
+    auto base_sigmas_vec = std::vector<float>(num_train_timesteps_);
+    for (int i = 0; i < num_train_timesteps_; ++i) {
+      float alpha_cumprod = alphas_cumprod_(i);
+      base_sigmas_vec[i] = std::sqrt((1.0f - alpha_cumprod) / alpha_cumprod);
     }
 
-    xt::xarray<float> selected_sigmas = xt::zeros<float>({timesteps_.size()});
-    for (size_t i = 0; i < timesteps_.size(); ++i) {
-      size_t idx = size_t(timesteps_(i));
-      selected_sigmas(i) = sigmas_(idx);
+    if (use_karras_sigmas_) {
+      std::vector<float> reversed(base_sigmas_vec.rbegin(),
+                                  base_sigmas_vec.rend());
+      auto karras_sigmas =
+          _convert_to_karras_vec(reversed, num_inference_steps);
+
+      std::vector<float> log_sigmas(num_train_timesteps_);
+      for (int i = 0; i < num_train_timesteps_; ++i) {
+        log_sigmas[i] = std::log(std::max(base_sigmas_vec[i], 1e-10f));
+      }
+
+      auto timesteps_vec = std::vector<float>(num_inference_steps);
+      for (int i = 0; i < num_inference_steps; ++i) {
+        timesteps_vec[i] =
+            std::round(_sigma_to_t(karras_sigmas[i], log_sigmas));
+      }
+      timesteps_ = xt::adapt(timesteps_vec);
+
+      auto sigmas_vec = std::vector<float>(num_inference_steps + 1);
+      for (int i = 0; i < num_inference_steps; ++i) {
+        sigmas_vec[i] = karras_sigmas[i];
+      }
+      sigmas_vec[num_inference_steps] = 0.0f;
+      sigmas_ = xt::adapt(sigmas_vec);
+    } else {
+      if (timestep_spacing_ == "linspace") {
+        // np.linspace(0, N-1, M+1).round()[::-1][:-1]
+        auto timesteps_vec = std::vector<float>(num_inference_steps);
+        for (int i = 0; i < num_inference_steps; ++i) {
+          timesteps_vec[i] = std::round(float(num_inference_steps - i) *
+                                        float(num_train_timesteps_ - 1) /
+                                        float(num_inference_steps));
+        }
+        timesteps_ = xt::adapt(timesteps_vec);
+      } else if (timestep_spacing_ == "leading") {
+        int step_ratio = num_train_timesteps_ / (num_inference_steps + 1);
+        auto timesteps_vec = std::vector<float>(num_inference_steps);
+        for (int i = 0; i < num_inference_steps; ++i) {
+          timesteps_vec[i] = float((num_inference_steps - i) * step_ratio);
+        }
+        timesteps_ = xt::adapt(timesteps_vec);
+      } else if (timestep_spacing_ == "trailing") {
+        float step_ratio =
+            float(num_train_timesteps_) / float(num_inference_steps);
+        auto timesteps_vec = std::vector<float>(num_inference_steps);
+        for (int i = 0; i < num_inference_steps; ++i) {
+          timesteps_vec[i] =
+              std::round(float(num_train_timesteps_) - float(i) * step_ratio) -
+              1.0f;
+        }
+        timesteps_ = xt::adapt(timesteps_vec);
+      } else {
+        throw std::runtime_error(timestep_spacing_ + " is not supported");
+      }
+
+      // Interpolate sigmas using np.interp logic; final sigma is 0
+      // (final_sigmas_type="zero").
+      auto sigmas_vec = std::vector<float>(num_inference_steps + 1);
+      for (int i = 0; i < num_inference_steps; ++i) {
+        float t = timesteps_(i);
+        if (t <= 0.0f) {
+          sigmas_vec[i] = base_sigmas_vec[0];
+        } else if (t >= float(num_train_timesteps_ - 1)) {
+          sigmas_vec[i] = base_sigmas_vec[num_train_timesteps_ - 1];
+        } else {
+          int t_floor = int(std::floor(t));
+          int t_ceil = int(std::ceil(t));
+          float weight = t - float(t_floor);
+          sigmas_vec[i] = base_sigmas_vec[t_floor] * (1.0f - weight) +
+                          base_sigmas_vec[t_ceil] * weight;
+        }
+      }
+      sigmas_vec[num_inference_steps] = 0.0f;
+      sigmas_ = xt::adapt(sigmas_vec);
     }
-    sigmas_ = xt::concatenate(
-        std::make_tuple(selected_sigmas, xt::zeros<float>({1})));
 
     model_outputs_.clear();
     model_outputs_.resize(solver_order_);
@@ -83,6 +158,49 @@ class DPMSolverMultistepScheduler : public Scheduler {
     lower_order_nums_ = 0;
     step_index_ = std::nullopt;
     begin_index_ = std::nullopt;
+  }
+
+  std::vector<float> _convert_to_karras_vec(const std::vector<float> &in_sigmas,
+                                            int num_inference_steps) const {
+    float sigma_min = in_sigmas.back();
+    float sigma_max = in_sigmas.front();
+
+    const float rho = 7.0f;
+    float min_inv_rho = std::pow(sigma_min, 1.0f / rho);
+    float max_inv_rho = std::pow(sigma_max, 1.0f / rho);
+
+    std::vector<float> out(num_inference_steps);
+    for (int i = 0; i < num_inference_steps; ++i) {
+      float ramp = (num_inference_steps == 1)
+                       ? 0.0f
+                       : float(i) / float(num_inference_steps - 1);
+      float v = max_inv_rho + ramp * (min_inv_rho - max_inv_rho);
+      out[i] = std::pow(v, rho);
+    }
+    return out;
+  }
+
+  float _sigma_to_t(float sigma, const std::vector<float> &log_sigmas) const {
+    float log_sigma = std::log(std::max(sigma, 1e-10f));
+    int n = int(log_sigmas.size());
+
+    int low_idx = 0;
+    for (int i = 0; i < n; ++i) {
+      if (log_sigmas[i] <= log_sigma) {
+        low_idx = i;
+      }
+    }
+    if (low_idx > n - 2) low_idx = n - 2;
+    int high_idx = low_idx + 1;
+
+    float low = log_sigmas[low_idx];
+    float high = log_sigmas[high_idx];
+
+    float w = (low - log_sigma) / (low - high);
+    if (w < 0.0f) w = 0.0f;
+    if (w > 1.0f) w = 1.0f;
+
+    return (1.0f - w) * float(low_idx) + w * float(high_idx);
   }
 
   std::tuple<float, float> _sigma_to_alpha_sigma_t(float sigma) const {
@@ -129,6 +247,17 @@ class DPMSolverMultistepScheduler : public Scheduler {
     float lambda_s = std::log(alpha_s) - std::log(sigma_s_val);
     float h = lambda_t - lambda_s;
 
+    if (algorithm_type_ == "sde-dpmsolver++") {
+      float one_minus_exp_neg_2h = 1.0f - std::exp(-2.0f * h);
+      xt::xarray<float> noise =
+          xt::random::randn<float>(model_output.shape(), 0.0f, 1.0f,
+                                   xt::random::get_default_random_engine());
+      return (sigma_t_val / sigma_s_val * std::exp(-h)) * sample +
+             (alpha_t * one_minus_exp_neg_2h) * model_output +
+             (sigma_t_val * std::sqrt(std::max(one_minus_exp_neg_2h, 0.0f))) *
+                 noise;
+    }
+
     return (sigma_t_val / sigma_s_val) * sample -
            alpha_t * (std::exp(-h) - 1.0f) * model_output;
   }
@@ -157,6 +286,17 @@ class DPMSolverMultistepScheduler : public Scheduler {
 
     xt::xarray<float> D0 = m0;
     xt::xarray<float> D1 = (1.0f / r0) * (m0 - m1);
+
+    if (algorithm_type_ == "sde-dpmsolver++") {
+      float one_minus_exp_neg_2h = 1.0f - std::exp(-2.0f * h);
+      xt::xarray<float> noise = xt::random::randn<float>(
+          sample.shape(), 0.0f, 1.0f, xt::random::get_default_random_engine());
+      return (sigma_t_val / sigma_s0_val * std::exp(-h)) * sample +
+             (alpha_t * one_minus_exp_neg_2h) * D0 +
+             (0.5f * alpha_t * one_minus_exp_neg_2h) * D1 +
+             (sigma_t_val * std::sqrt(std::max(one_minus_exp_neg_2h, 0.0f))) *
+                 noise;
+    }
 
     return (sigma_t_val / sigma_s0_val) * sample -
            (alpha_t * (std::exp(-h) - 1.0f)) * D0 -
@@ -206,7 +346,7 @@ class DPMSolverMultistepScheduler : public Scheduler {
   int index_for_timestep(int timestep) const {
     std::vector<size_t> indices;
     for (size_t i = 0; i < timesteps_.size(); ++i) {
-      if (timesteps_(i) == timestep) {
+      if (int(timesteps_(i)) == timestep) {
         indices.push_back(i);
       }
     }
@@ -233,20 +373,24 @@ class DPMSolverMultistepScheduler : public Scheduler {
         convert_model_output(model_output, sample);
 
     for (int i = 0; i < solver_order_ - 1; ++i) {
-      model_outputs_[i] = model_outputs_[i + 1];
+      model_outputs_[i] = std::move(model_outputs_[i + 1]);
     }
-    model_outputs_.back() = converted_output;
+    model_outputs_.back() = std::move(converted_output);
 
-    bool lower_order_final =
-        (step_index_.value() == int(timesteps_.size()) - 1) ||
-        (lower_order_final_ && timesteps_.size() < 15);
+    // Match diffusers: at the last step always fall back to first-order,
+    // because our sigmas array ends in 0 (equivalent to
+    // final_sigmas_type="zero"). The previous `||` form was a bug — when
+    // timesteps.size() < 15 it silently degraded *every* step to first-order.
+    bool is_last_step = (step_index_.value() == int(timesteps_.size()) - 1);
+    bool lower_order_final = is_last_step;
     bool lower_order_second =
         (step_index_.value() == int(timesteps_.size()) - 2) &&
         lower_order_final_ && timesteps_.size() < 15;
 
     xt::xarray<float> prev_sample;
     if (solver_order_ == 1 || lower_order_nums_ < 1 || lower_order_final) {
-      prev_sample = dpm_solver_first_order_update(converted_output, sample);
+      prev_sample =
+          dpm_solver_first_order_update(model_outputs_.back(), sample);
     } else if (solver_order_ == 2 || lower_order_nums_ < 2 ||
                lower_order_second) {
       prev_sample =
@@ -330,6 +474,8 @@ class DPMSolverMultistepScheduler : public Scheduler {
   int solver_order_;
   std::string prediction_type_;
   std::string timestep_spacing_;
+  bool use_karras_sigmas_;
+  std::string algorithm_type_;
   bool lower_order_final_;
 
   xt::xarray<float> betas_;

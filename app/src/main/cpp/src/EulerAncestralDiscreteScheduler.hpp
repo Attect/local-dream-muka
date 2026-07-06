@@ -17,13 +17,11 @@
 
 class EulerAncestralDiscreteScheduler : public Scheduler {
  public:
-  EulerAncestralDiscreteScheduler(int num_train_timesteps, float beta_start,
-                                  float beta_end,
-                                  const std::string &beta_schedule,
-                                  const std::string &prediction_type,
-                                  const std::string &timestep_spacing,
-                                  int steps_offset = 0,
-                                  bool rescale_betas_zero_snr = false)
+  EulerAncestralDiscreteScheduler(
+      int num_train_timesteps, float beta_start, float beta_end,
+      const std::string &beta_schedule, const std::string &prediction_type,
+      const std::string &timestep_spacing, int steps_offset = 0,
+      bool rescale_betas_zero_snr = false, bool use_karras_sigmas = false)
       : num_train_timesteps_(num_train_timesteps),
         beta_start_(beta_start),
         beta_end_(beta_end),
@@ -32,6 +30,7 @@ class EulerAncestralDiscreteScheduler : public Scheduler {
         timestep_spacing_(timestep_spacing),
         steps_offset_(steps_offset),
         rescale_betas_zero_snr_(rescale_betas_zero_snr),
+        use_karras_sigmas_(use_karras_sigmas),
         is_scale_input_called_(false) {
     // Initialize betas
     if (beta_schedule == "linear") {
@@ -85,6 +84,45 @@ class EulerAncestralDiscreteScheduler : public Scheduler {
   void set_timesteps(int num_inference_steps) override {
     num_inference_steps_ = num_inference_steps;
 
+    // Base sigmas from alphas_cumprod (ascending order)
+    auto base_sigmas_vec = std::vector<float>(num_train_timesteps_);
+    for (int i = 0; i < num_train_timesteps_; ++i) {
+      float alpha_cumprod = alphas_cumprod_(i);
+      base_sigmas_vec[i] = std::sqrt((1.0f - alpha_cumprod) / alpha_cumprod);
+    }
+
+    if (use_karras_sigmas_) {
+      // Reverse to descending and apply Karras schedule
+      std::vector<float> reversed(base_sigmas_vec.rbegin(),
+                                  base_sigmas_vec.rend());
+      auto karras_sigmas =
+          _convert_to_karras_vec(reversed, num_inference_steps);
+
+      // log_sigmas in ascending order (same as base_sigmas_vec)
+      std::vector<float> log_sigmas(num_train_timesteps_);
+      for (int i = 0; i < num_train_timesteps_; ++i) {
+        log_sigmas[i] = std::log(std::max(base_sigmas_vec[i], 1e-10f));
+      }
+
+      auto timesteps_vec = std::vector<float>(num_inference_steps);
+      for (int i = 0; i < num_inference_steps; ++i) {
+        timesteps_vec[i] = _sigma_to_t(karras_sigmas[i], log_sigmas);
+      }
+      timesteps_ = xt::adapt(timesteps_vec);
+
+      auto sigmas_vec = std::vector<float>(num_inference_steps + 1);
+      for (int i = 0; i < num_inference_steps; ++i) {
+        sigmas_vec[i] = karras_sigmas[i];
+      }
+      sigmas_vec[num_inference_steps] = 0.0f;
+      sigmas_ = xt::adapt(sigmas_vec);
+
+      step_index_ = std::nullopt;
+      begin_index_ = std::nullopt;
+      is_scale_input_called_ = false;
+      return;
+    }
+
     if (timestep_spacing_ == "linspace") {
       auto timesteps_vec = std::vector<float>(num_inference_steps);
       for (int i = 0; i < num_inference_steps; ++i) {
@@ -112,14 +150,6 @@ class EulerAncestralDiscreteScheduler : public Scheduler {
       timesteps_ = xt::adapt(timesteps_vec);
     } else {
       throw std::runtime_error(timestep_spacing_ + " is not supported");
-    }
-
-    // Calculate sigmas from alphas_cumprod (match PyTorch exactly)
-    // sigmas = np.array(((1 - alphas_cumprod) / alphas_cumprod) ** 0.5)
-    auto base_sigmas_vec = std::vector<float>(num_train_timesteps_);
-    for (int i = 0; i < num_train_timesteps_; ++i) {
-      float alpha_cumprod = alphas_cumprod_(i);
-      base_sigmas_vec[i] = std::sqrt((1.0f - alpha_cumprod) / alpha_cumprod);
     }
 
     // Interpolate sigmas using np.interp logic
@@ -331,6 +361,7 @@ class EulerAncestralDiscreteScheduler : public Scheduler {
   std::string timestep_spacing_;
   int steps_offset_;
   bool rescale_betas_zero_snr_;
+  bool use_karras_sigmas_;
   bool is_scale_input_called_;
 
   xt::xarray<float> betas_;
@@ -365,6 +396,51 @@ class EulerAncestralDiscreteScheduler : public Scheduler {
     } else {
       step_index_ = index_for_timestep(timestep);
     }
+  }
+
+  std::vector<float> _convert_to_karras_vec(const std::vector<float> &in_sigmas,
+                                            int num_inference_steps) const {
+    float sigma_min = in_sigmas.back();
+    float sigma_max = in_sigmas.front();
+
+    const float rho = 7.0f;
+    float min_inv_rho = std::pow(sigma_min, 1.0f / rho);
+    float max_inv_rho = std::pow(sigma_max, 1.0f / rho);
+
+    std::vector<float> out(num_inference_steps);
+    for (int i = 0; i < num_inference_steps; ++i) {
+      float ramp = (num_inference_steps == 1)
+                       ? 0.0f
+                       : float(i) / float(num_inference_steps - 1);
+      float v = max_inv_rho + ramp * (min_inv_rho - max_inv_rho);
+      out[i] = std::pow(v, rho);
+    }
+    return out;
+  }
+
+  float _sigma_to_t(float sigma, const std::vector<float> &log_sigmas) const {
+    float log_sigma = std::log(std::max(sigma, 1e-10f));
+    int n = int(log_sigmas.size());
+
+    // log_sigmas is ascending: find the largest i where log_sigmas[i] <=
+    // log_sigma.
+    int low_idx = 0;
+    for (int i = 0; i < n; ++i) {
+      if (log_sigmas[i] <= log_sigma) {
+        low_idx = i;
+      }
+    }
+    if (low_idx > n - 2) low_idx = n - 2;
+    int high_idx = low_idx + 1;
+
+    float low = log_sigmas[low_idx];
+    float high = log_sigmas[high_idx];
+
+    float w = (low - log_sigma) / (low - high);
+    if (w < 0.0f) w = 0.0f;
+    if (w > 1.0f) w = 1.0f;
+
+    return (1.0f - w) * float(low_idx) + w * float(high_idx);
   }
 
   xt::xarray<float> betas_for_alpha_bar(int num_diffusion_timesteps,
