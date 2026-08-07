@@ -15,7 +15,10 @@ import androidx.core.content.ContextCompat
 import androidx.core.graphics.createBitmap
 import androidx.core.graphics.scale
 import io.github.xororz.localdream.data.GenerationMode
+import io.github.xororz.localdream.remote.RemoteApiClient
+import io.github.xororz.localdream.remote.RemoteProtocol
 import io.github.xororz.localdream.service.BackendService
+import io.github.xororz.localdream.service.BackgroundGenerationService
 import io.github.xororz.localdream.utils.Http
 import java.io.ByteArrayOutputStream
 import java.util.Base64
@@ -58,13 +61,16 @@ private val healthClient: OkHttpClient by lazy {
 
 internal data class TokenizeResult(val count: Int, val maxLength: Int, val overflowOffset: Int)
 
-internal suspend fun tokenizePromptRequest(text: String): TokenizeResult? = withContext(Dispatchers.IO) {
+internal suspend fun tokenizePromptRequest(
+    text: String,
+    backendHost: String = BackgroundGenerationService.LOCAL_BACKEND_HOST,
+): TokenizeResult? = withContext(Dispatchers.IO) {
     try {
         val body = JSONObject().apply { put("prompt", text) }
             .toString()
             .toRequestBody("application/json".toMediaTypeOrNull())
         val request = Request.Builder()
-            .url("http://localhost:8081/tokenize")
+            .url("http://$backendHost/tokenize")
             .post(body)
             .build()
         tokenizeClient.newCall(request).execute().use { response ->
@@ -157,6 +163,56 @@ internal suspend fun checkBackendHealth(
         withContext(Dispatchers.Main) {
             onUnhealthy()
         }
+    }
+}
+
+/**
+ * Remote counterpart of [checkBackendHealth]: waits until the host device's
+ * backend is serving [expectedModelId] at exactly [expectedWidth] x
+ * [expectedHeight] and its generation port answers /health. The resolution
+ * match matters: the host may still be serving the same model at an older
+ * resolution when the check starts (the /select that switches it races this
+ * poll), and declaring Ready then would send generations to the wrong patch.
+ */
+internal suspend fun checkRemoteBackendHealth(
+    client: RemoteApiClient,
+    expectedModelId: String,
+    expectedWidth: Int,
+    expectedHeight: Int,
+    onHealthy: () -> Unit,
+    onUnhealthy: () -> Unit,
+) = withContext(Dispatchers.IO) {
+    val startTime = System.currentTimeMillis()
+    val timeoutDuration = 120_000L
+    var pollDelayMs = 300L
+
+    while (currentCoroutineContext().isActive) {
+        if (System.currentTimeMillis() - startTime > timeoutDuration) {
+            withContext(Dispatchers.Main) { onUnhealthy() }
+            break
+        }
+
+        val status = client.fetchStatus()
+        if (status != null) {
+            val ownError = status.state == RemoteProtocol.STATE_ERROR &&
+                (status.errorModelId == null || status.errorModelId == expectedModelId)
+            if (ownError) {
+                withContext(Dispatchers.Main) { onUnhealthy() }
+                break
+            }
+            if (status.servingModelId == expectedModelId &&
+                status.state == RemoteProtocol.STATE_RUNNING &&
+                status.width == expectedWidth &&
+                status.height == expectedHeight &&
+                client.checkGenerationHealth()
+            ) {
+                withContext(Dispatchers.Main) { onHealthy() }
+                break
+            }
+        }
+
+        delay(pollDelayMs)
+        pollDelayMs = (pollDelayMs * 2).coerceAtMost(1000L)
     }
 }
 
