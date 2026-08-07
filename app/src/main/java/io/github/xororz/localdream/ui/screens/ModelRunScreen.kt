@@ -587,7 +587,7 @@ fun ModelRunScreen(modelId: String, navController: NavController, modifier: Modi
 
     val onBatchCountsChange = remember {
         { value: Float ->
-            batchCounts = value.roundToInt().coerceIn(1, 10)
+            batchCounts = value.roundToInt().coerceIn(1, 100)
             saveAllFields()
         }
     }

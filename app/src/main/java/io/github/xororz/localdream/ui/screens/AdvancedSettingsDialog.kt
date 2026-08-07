@@ -377,7 +377,7 @@ internal fun AdvancedSettingsDialog(
                     Slider(
                         value = batchCounts.toFloat(),
                         onValueChange = onBatchCountsChange,
-                        valueRange = 1f..10f,
+                        valueRange = 1f..100f,
                         steps = 8,
                         modifier = Modifier.fillMaxWidth(),
                     )
