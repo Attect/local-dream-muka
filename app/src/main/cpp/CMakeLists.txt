@@ -7,14 +7,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # QNN SDK PATH
 set(QNN_SDK_ROOT E:\\qairt\\2.39.0.250926)
 
-file(COPY ${QNN_SDK_ROOT}/examples/QNN/SampleApp/SampleApp/
-    DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/SampleApp)
-execute_process(COMMAND git apply --directory=app/src/main/cpp/ --verbose ${CMAKE_CURRENT_SOURCE_DIR}/SampleApp.patch
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    RESULT_VARIABLE patch_result
-    OUTPUT_VARIABLE patch_output
-    ERROR_VARIABLE patch_error
-)
+# SampleApp 已打 patch 的状态直接 vendored 在 3rdparty/SampleApp（行尾差异会致
+# git apply 失败，故不再每次 configure 复制+打补丁）；缺失时才从 QNN SDK 重建。
+if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/SampleApp/src/QnnSampleApp.cpp)
+    file(COPY ${QNN_SDK_ROOT}/examples/QNN/SampleApp/SampleApp/
+        DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/SampleApp)
+    execute_process(COMMAND git apply --whitespace=fix --directory=app/src/main/cpp/ --verbose ${CMAKE_CURRENT_SOURCE_DIR}/SampleApp.patch
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        RESULT_VARIABLE patch_result
+        OUTPUT_VARIABLE patch_output
+        ERROR_VARIABLE patch_error
+    )
+endif()
 message(STATUS "Patch: ${patch_result}")
 message(STATUS "Patch: ${patch_output}")
 message(STATUS "Patch: ${patch_error}")
@@ -61,7 +65,9 @@ file(COPY ${QNN_SDK_ROOT}/lib/hexagon-v81/unsigned/libQnnHtpV81.so
 file(COPY ${QNN_SDK_ROOT}/lib/hexagon-v81/unsigned/libQnnHtpV81Skel.so
     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/qnnlibs)
 
-if(WIN32)
+# 注意：交叉编译 Android 时 WIN32 描述的是目标系统（false），
+# host 判定必须用 CMAKE_HOST_WIN32，否则 ANDROID_TOOLCHAIN_ROOT 拼出 linux-x86_64。
+if(CMAKE_HOST_WIN32)
     set(PLATFORM_NAME "windows")
     set(HOST_TAG "windows-x86_64")
 else()
@@ -199,3 +205,28 @@ target_link_libraries(${PROJECT_NAME}
     tokenizers_cpp
     libzstd
 )
+
+# MoeApk JNI 共享库（去 httplib 进程壳）：与可执行版同源，入口换 src_jni/jni_bridge.cpp
+option(BUILD_JNI_LIB "Build MoeApk JNI shared library" ON)
+if(BUILD_JNI_LIB)
+    set(JNI_SOURCES ${SOURCES})
+    list(REMOVE_ITEM JNI_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+    list(APPEND JNI_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src_jni/jni_bridge.cpp")
+    add_library(stable_diffusion_jni SHARED ${JNI_SOURCES})
+    target_include_directories(stable_diffusion_jni PRIVATE ${PACKAGE_INCLUDES})
+    target_compile_definitions(stable_diffusion_jni PRIVATE XTENSOR_USE_XSIMD)
+    if(NOT QNN_DEBUG_ENABLE)
+        target_link_options(stable_diffusion_jni PRIVATE "-Wl,-s")
+    endif()
+    set_target_properties(stable_diffusion_jni PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib/${OUTPUT_SUFFIX}"
+        OUTPUT_NAME "stable_diffusion_jni"
+    )
+    target_link_libraries(stable_diffusion_jni
+        PRIVATE
+        ${PLATFORM_LIBS}
+        MNN
+        tokenizers_cpp
+        libzstd
+    )
+endif()
