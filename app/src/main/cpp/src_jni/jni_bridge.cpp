@@ -13,6 +13,8 @@
 
 #include <jni.h>
 
+#include <android/dlext.h>
+
 #include <atomic>
 #include <chrono>
 #include <dlfcn.h>
@@ -21,10 +23,12 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "Config.hpp"
 #include "EngineCore.hpp"
 #include "MnnUtils.hpp"
+#include "PAL/DynamicLoading.hpp"
 #include "QnnRuntime.hpp"
 #include "RequestParser.hpp"
 #include "SDUtils.hpp"
@@ -62,6 +66,9 @@ ServerOptions parseOptions(const nlohmann::json &j) {
   opts.model_dir = j.value("model_dir", "");
   if (opts.model_dir.empty()) throw std::runtime_error("model_dir required");
   opts.lib_dir = j.value("lib_dir", "");
+  opts.log_file = j.value("log_file", "");
+  opts.host_dir = j.value("host_dir", "");
+  opts.aux_dir = j.value("aux_dir", "");
   opts.patch_path = j.value("patch", "");
   opts.safety_checker_path = j.value("safety_checker", "");
   opts.nsfw_threshold = j.value("nsfw_threshold", 0.5f);
@@ -102,6 +109,15 @@ Java_com_moeapk_ai_engine_diffusion_DiffusionEngineImpl_nativeInit(
     const char *optsStr = env->GetStringUTFChars(optionsJson, nullptr);
     ServerOptions opts = parseOptions(nlohmann::json::parse(optsStr));
     env->ReleaseStringUTFChars(optionsJson, optsStr);
+
+    // App 进程 stdout/stderr 默认丢弃：QNN 初始化诊断依赖引擎的 stdout 日志，
+    // 经 log_file 重定向到 App 可读的 cache 目录文件。
+    if (!opts.log_file.empty()) {
+      std::freopen(opts.log_file.c_str(), "a", stdout);
+      std::freopen(opts.log_file.c_str(), "a", stderr);
+      setvbuf(stdout, nullptr, _IOLBF, 0);
+      setvbuf(stderr, nullptr, _IOLBF, 0);
+    }
 
     if (!qnn::log::initializeLogging()) {
       // 已初始化过则返回 false，忽略
@@ -151,26 +167,29 @@ Java_com_moeapk_ai_engine_diffusion_DiffusionEngineImpl_nativeInit(
     if (!opts.isMnn()) {
       if (opts.lib_dir.empty())
         throw std::runtime_error("lib_dir required for QNN model types");
-      // 进程内加载与原版独立进程的差异补偿：原版由父进程在启动前设好
-      // LD_LIBRARY_PATH/DSP_LIBRARY_PATH，libQnnHtp.so 内部对 per-chip
-      // 库的无名 dlopen 靠 LD_LIBRARY_PATH 命中；进程内该变量已定型，
-      // 改为预载全部 per-chip host 库（dlopen 绝对路径后，同名 soname
-      // 再被无名 dlopen 时直接复用命中）。Skel 是 Hexagon DSP 侧文件，
-      // host 不加载，由 fastrpc 按 DSP/ADSP_LIBRARY_PATH 从文件系统读取。
+      // host 侧 QNN 链（libQnnHtp/Stub/libcdsprpc→libhidlbase→…）打进 App
+      // jniLibs：App 命名空间的 default_library_paths 含 nativeLibraryDir，
+      // NEEDED 链在其中闭环（bionic 全局 soinfo 表使命名空间内 NEEDED
+      // ld-android.so 命中 linker 自身）。host_dir = nativeLibraryDir。
+      // DSP 侧文件（*Skel.so / libQnnHtpVxx.so）经 DSP_LIBRARY_PATH 由
+      // fastrpc 读取：lib_dir = 运行时下载的引擎目录。
       setenv("DSP_LIBRARY_PATH", opts.lib_dir.c_str(), 1);
       setenv("ADSP_LIBRARY_PATH", opts.lib_dir.c_str(), 1);
-      std::error_code ec;
-      for (const auto &e :
-           std::filesystem::directory_iterator(opts.lib_dir, ec)) {
-        const auto name = e.path().filename().string();
-        if (name.rfind("libQnnHtpV", 0) == 0 &&
-            name.find("Skel") == std::string::npos &&
-            e.path().extension() == ".so") {
+      // aux_dir：文件名非 lib 前缀的依赖（vendor.qti.hardware.dsp@1.0.so）
+      // 无法经 APK jniLibs 解压（系统只落盘 lib*.so），App 侧解压到该目录，
+      // 此处预载（绝对路径进命名空间后，NEEDED 按 soname 命中）。
+      if (!opts.aux_dir.empty()) {
+        std::error_code ec;
+        for (const auto &e :
+             std::filesystem::directory_iterator(opts.aux_dir, ec)) {
+          if (e.path().extension() != ".so") continue;
           if (!dlopen(e.path().c_str(), RTLD_NOW | RTLD_GLOBAL))
-            QNN_WARN("preload %s failed: %s", name.c_str(), dlerror());
+            QNN_WARN("aux preload %s failed: %s",
+                     e.path().filename().string().c_str(), dlerror());
         }
       }
-      if (!qnn_runtime::init(opts.lib_dir))
+      const std::string host_dir = opts.host_dir.empty() ? opts.lib_dir : opts.host_dir;
+      if (!qnn_runtime::init(host_dir))
         throw std::runtime_error("Failed get QNN system func ptrs");
     }
 

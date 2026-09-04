@@ -53,6 +53,9 @@ struct ServerOptions {
   bool upscaler_mode = false;
   bool convert_mode = false;
   bool convert_clip_skip_2 = false;
+  std::string log_file;  // JNI 进程内 stdout/stderr 重定向目标（空=不重定向）
+  std::string host_dir;  // QNN host 侧库目录（APK nativeLibraryDir）；空=同 lib_dir
+  std::string aux_dir;   // 非 lib 前缀依赖的解压目录（jniLibs 命名规则之外的库）
 
   bool isSdxl() const { return type == ModelType::kSdxl; }
   bool isAnima() const { return type == ModelType::kAnima; }

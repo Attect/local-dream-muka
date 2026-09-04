@@ -1046,6 +1046,8 @@ inline GenerationResult Pipeline::generate(
             runUnetTiled(req, latents_scaled, static_cast<int>(current_ts),
                          skip_uncond, cond);
       } else {
+        QNN_INFO("step%d: alloc latent bufs (single=%d floats)", i,
+                 single_latent_size);
         std::vector<float> latents_in_vec;
         latents_in_vec.reserve(batch_size * single_latent_size);
         latents_in_vec.insert(latents_in_vec.end(), latents_scaled.begin(),
@@ -1053,9 +1055,11 @@ inline GenerationResult Pipeline::generate(
         latents_in_vec.insert(latents_in_vec.end(), latents_scaled.begin(),
                               latents_scaled.end());
         std::vector<float> unet_out_latents(batch_size * single_latent_size);
+        QNN_INFO("step%d: bufs ready, runUnetStep", i);
 
         runUnetStep(req, latents_in_vec.data(), current_ts, skip_uncond, cond,
                     unet_out_latents.data());
+        QNN_INFO("step%d: unet done, cfg merge", i);
 
         if (skip_uncond) {
           // cfg = 1 path: only the cond half of unet_out_latents was filled.
@@ -1064,11 +1068,18 @@ inline GenerationResult Pipeline::generate(
               unet_out_latents.end());
           noise_pred = xt::adapt(cond_only, shape);
         } else {
-          xt::xarray<float> noise_pred_batch =
-              xt::adapt(unet_out_latents, shape_batch2);
-          xt::xarray<float> uncond = xt::view(noise_pred_batch, 0);
-          xt::xarray<float> txt = xt::view(noise_pred_batch, 1);
-          noise_pred = xt::eval(uncond + req.cfg * (txt - uncond));
+          QNN_INFO("step%d: cfg merge", i);
+          // 手写循环替代 xtensor view 表达式：view 参与的表达式 eval 在 JNI
+          // 进程内 bad_alloc（init 期 xarray 自测正常，疑 view 求值路径与
+          // 进程环境相互作用；手写版等价且少两次临时分配）。
+          std::vector<float> np_vec(single_latent_size);
+          const float *up = unet_out_latents.data();
+          const float *tp = unet_out_latents.data() + single_latent_size;
+          const float cfg = req.cfg;
+          for (int k = 0; k < single_latent_size; ++k)
+            np_vec[k] = up[k] + cfg * (tp[k] - up[k]);
+          noise_pred = xt::adapt(np_vec, shape);
+          QNN_INFO("step%d: cfg merge done", i);
         }
       }
 
@@ -1127,7 +1138,9 @@ inline GenerationResult Pipeline::generate(
         }
       }
 
+      QNN_INFO("step%d: scheduler step", i);
       latents = scheduler->step(noise_pred, timesteps(i), latents).prev_sample;
+      QNN_INFO("step%d: scheduler done", i);
 
       // Ultrafix low-frequency skip residual: pull only the LOW-frequency
       // band of the latent back toward the inversion trajectory, leaving
