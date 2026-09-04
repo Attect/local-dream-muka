@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <dlfcn.h>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -150,6 +151,25 @@ Java_com_moeapk_ai_engine_diffusion_DiffusionEngineImpl_nativeInit(
     if (!opts.isMnn()) {
       if (opts.lib_dir.empty())
         throw std::runtime_error("lib_dir required for QNN model types");
+      // 进程内加载与原版独立进程的差异补偿：原版由父进程在启动前设好
+      // LD_LIBRARY_PATH/DSP_LIBRARY_PATH，libQnnHtp.so 内部对 per-chip
+      // 库的无名 dlopen 靠 LD_LIBRARY_PATH 命中；进程内该变量已定型，
+      // 改为预载全部 per-chip host 库（dlopen 绝对路径后，同名 soname
+      // 再被无名 dlopen 时直接复用命中）。Skel 是 Hexagon DSP 侧文件，
+      // host 不加载，由 fastrpc 按 DSP/ADSP_LIBRARY_PATH 从文件系统读取。
+      setenv("DSP_LIBRARY_PATH", opts.lib_dir.c_str(), 1);
+      setenv("ADSP_LIBRARY_PATH", opts.lib_dir.c_str(), 1);
+      std::error_code ec;
+      for (const auto &e :
+           std::filesystem::directory_iterator(opts.lib_dir, ec)) {
+        const auto name = e.path().filename().string();
+        if (name.rfind("libQnnHtpV", 0) == 0 &&
+            name.find("Skel") == std::string::npos &&
+            e.path().extension() == ".so") {
+          if (!dlopen(e.path().c_str(), RTLD_NOW | RTLD_GLOBAL))
+            QNN_WARN("preload %s failed: %s", name.c_str(), dlerror());
+        }
+      }
       if (!qnn_runtime::init(opts.lib_dir))
         throw std::runtime_error("Failed get QNN system func ptrs");
     }
